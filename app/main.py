@@ -1093,11 +1093,11 @@ def _generate_reset_token() -> str:
 def _send_password_reset_email(to_email: str, reset_token: str) -> bool:
     base_url = (os.getenv("APP_BASE_URL", "") or os.getenv("PUBLIC_APP_URL", "")).strip().rstrip("/")
     reset_link = f"{base_url}/auth?reset_token={reset_token}" if base_url else reset_token
-    subject = "Orkio password reset"
+    subject = "Orkio | Redefinição de senha"
     text_body = (
-        "We received a request to reset your Orkio password.\n\n"
-        f"Use this link or token within {PASSWORD_RESET_EXPIRES_MINUTES} minutes:\n{reset_link}\n\n"
-        "If you did not request this change, you can ignore this message."
+        "Recebemos uma solicitação para redefinir sua senha do Orkio.\n\n"
+        f"Use este link dentro de {PASSWORD_RESET_EXPIRES_MINUTES} minutos:\n{reset_link}\n\n"
+        "Se você não solicitou essa alteração, pode ignorar esta mensagem."
     )
     return _send_resend_email(to_email, subject, text_body)
 
@@ -1118,17 +1118,57 @@ def _score_founder_opportunity(email: str, interest_type: str, message: str) -> 
         score -= 3
     return max(score, 0)
 
-def _build_founder_brief(full_name: str, email: str, interest_type: str, message: str, score: int) -> str:
+def _build_founder_brief(full_name: str, email: str, interest_type: str, conversation_summary: str, score: int) -> str:
+    next_step = "Follow-up prioritário do founder." if score >= FOUNDER_FOLLOWUP_THRESHOLD else "Continuar aquecimento com contexto."
     return (
-        f"Lead: {full_name or 'Unknown'}\\n"
-        f"Email: {email or 'N/A'}\\n"
-        f"Interest type: {interest_type or 'general'}\\n"
-        f"Score: {score}\\n\\n"
-        "Conversation summary:\\n"
-        f"{(message or '').strip()}\\n\\n"
-        "Recommended next step:\\n"
-        + ("Priority founder follow-up." if score >= FOUNDER_FOLLOWUP_THRESHOLD else "Warm continue.")
+        f"Lead: {full_name or 'Não identificado'}\n"
+        f"Email: {email or 'N/A'}\n"
+        f"Tipo de interesse: {interest_type or 'geral'}\n"
+        f"Score: {score}\n\n"
+        "Resumo da conversa:\n"
+        f"{(conversation_summary or '').strip()}\n\n"
+        "Próximo passo recomendado:\n"
+        f"{next_step}"
     )
+
+def _build_thread_handoff_summary(db: Session, org: str, thread_id: Optional[str], fallback_message: str, max_messages: int = 24) -> str:
+    fallback = (fallback_message or "").strip()
+    tid = (thread_id or "").strip()
+    if not tid:
+        return fallback
+    try:
+        rows = db.execute(
+            select(Message)
+            .where(Message.org_slug == org, Message.thread_id == tid)
+            .order_by(Message.created_at.asc())
+        ).scalars().all()
+    except Exception:
+        logger.exception("FOUNDER_HANDOFF_SUMMARY_LOAD_FAILED thread_id=%s", tid)
+        return fallback
+
+    parts: List[str] = []
+    for msg in rows[-max_messages:]:
+        role = (getattr(msg, "role", "") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        raw = (getattr(msg, "content", None) or "").strip()
+        if not raw:
+            continue
+        if "ORKIO_EVENT:" in raw:
+            raw = raw.split("ORKIO_EVENT:", 1)[0].strip()
+        if not raw:
+            continue
+        speaker = "Usuário" if role == "user" else ((getattr(msg, "agent_name", None) or "Orkio").strip() or "Orkio")
+        safe = _ascii_safe_text(raw)
+        if safe:
+            parts.append(f"{speaker}: {safe}")
+
+    if fallback:
+        safe_fallback = _ascii_safe_text(fallback)
+        if safe_fallback and all(safe_fallback not in p for p in parts):
+            parts.append(f"Usuário: {safe_fallback}")
+
+    return "\n".join(parts).strip()
 
 def _validate_access_code_no_consume(db: Session, org: str, code: str) -> Optional[SignupCode]:
     normalized = (code or "").strip().upper()
@@ -4450,7 +4490,7 @@ async def tts_endpoint(
     db: Session = Depends(get_db),
 ):
     """V2V-PATCH: Generate speech audio from text (OpenAI TTS).
-    Returns audio/mpeg. Resolves voice: message_id → agent_id → inp.voice → nova.
+    Returns audio/mpeg. Resolves voice: message_id → agent_id → inp.voice → default voice.
     Emits structured logs: v2v_tts_ok / v2v_tts_fail."""
     trace_id = x_trace_id or new_id()
     if OpenAI is None:
@@ -4459,11 +4499,12 @@ async def tts_endpoint(
     if not api_key:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
 
-    # Resolve voice: message_id → agent_id → inp.voice → nova
-    voice = inp.voice or "nova"
+    # Resolve voice: message_id → agent_id → inp.voice → configured default
+    default_tts_voice = (os.getenv("OPENAI_TTS_VOICE_DEFAULT", "") or os.getenv("OPENAI_REALTIME_VOICE_DEFAULT", "cedar")).strip() or "cedar"
+    voice = inp.voice or default_tts_voice
     org = get_request_org(user, x_org_slug)
-    _VALID_VOICES = ("alloy","ash","ballad","coral","echo","fable","onyx","nova","sage","shimmer","verse")
-    _VOICE_MAP = {"cedar": "nova", "marin": "alloy"}
+    _VALID_VOICES = ("alloy","ash","ballad","cedar","coral","echo","fable","marin","nova","onyx","sage","shimmer","verse")
+    _VOICE_MAP = {"nova": "cedar", "onyx": "echo", "fable": "sage"}
     resolved_via = "default"
     fallback_used = False
     try:
@@ -4490,8 +4531,9 @@ async def tts_endpoint(
     except Exception:
         logger.exception("TTS_VOICE_RESOLVE_FAILED trace_id=%s", trace_id)
 
-    voice = _VOICE_MAP.get((voice or "").strip().lower(), voice)
-    voice = voice if voice in _VALID_VOICES else "nova"
+    voice = _VOICE_MAP.get((voice or "").strip().lower(), (voice or "").strip().lower())
+    if voice not in _VALID_VOICES:
+        voice = default_tts_voice if default_tts_voice in _VALID_VOICES else "cedar"
     safe_resolved_via = _ascii_safe_text(resolved_via) or "default"
     speed = max(0.25, min(4.0, inp.speed))
     tts_input = _sanitize_tts_text(inp.text)
@@ -4532,11 +4574,12 @@ async def tts_endpoint(
             },
         )
     except Exception as e:
-        logger.warning("v2v_tts_fallback trace_id=%s original_model=%s original_voice=%s fallback_model=%s fallback_voice=%s error=%s", trace_id, tts_model, voice, "gpt-4o-mini-tts", "nova", str(e))
+        fallback_voice = {"cedar": "nova", "marin": "alloy"}.get(voice, "nova")
+        logger.warning("v2v_tts_fallback trace_id=%s org=%s original_model=%s original_voice=%s fallback_model=%s fallback_voice=%s error=%s", trace_id, org, tts_model, voice, "gpt-4o-mini-tts", fallback_voice, str(e))
         try:
             response = client.audio.speech.create(
                 model="gpt-4o-mini-tts",
-                voice="nova",
+                voice=fallback_voice,
                 input=tts_input,
                 speed=speed,
                 response_format="mp3",
@@ -4544,7 +4587,7 @@ async def tts_endpoint(
             from fastapi.responses import StreamingResponse
             import io
             audio_bytes = _read_audio_bytes(response)
-            logger.info("v2v_tts_ok trace_id=%s org=%s voice=%s bytes=%d fallback_used=%s", trace_id, org, "nova", len(audio_bytes), True)
+            logger.info("v2v_tts_ok trace_id=%s org=%s voice=%s bytes=%d fallback_used=%s", trace_id, org, fallback_voice, len(audio_bytes), True)
             return StreamingResponse(
                 io.BytesIO(audio_bytes),
                 media_type="audio/mpeg",
@@ -4552,7 +4595,7 @@ async def tts_endpoint(
                     "Content-Disposition": "inline; filename=tts.mp3",
                     "Cache-Control": "no-cache",
                     "X-Trace-Id": trace_id,
-                    "X-V2V-Voice": "nova",
+                    "X-V2V-Voice": fallback_voice,
                     "X-V2V-Resolved-Via": safe_resolved_via,
                     "X-V2V-Fallback-Used": "true",
                 },
@@ -5366,7 +5409,7 @@ def summit_get_config():
     cfg = get_summit_runtime_config(
         mode=os.getenv("ORKIO_RUNTIME_MODE", "summit"),
         response_profile=os.getenv("SUMMIT_RESPONSE_PROFILE", "stage"),
-        language_profile=os.getenv("SUMMIT_LANGUAGE_PROFILE", "en"),
+        language_profile=os.getenv("SUMMIT_LANGUAGE_PROFILE", "pt-BR"),
     )
     return {"ok": True, "config": cfg}
 
@@ -5826,7 +5869,8 @@ def founder_handoff(inp: FounderHandoffIn, x_org_slug: Optional[str] = Header(de
     email = user.get("email")
     full_name = user.get("name")
     score = _score_founder_opportunity(email or "", inp.interest_type, inp.message)
-    summary = _build_founder_brief(full_name or "", email or "", inp.interest_type, inp.message, score)
+    conversation_summary = _build_thread_handoff_summary(db, org, inp.thread_id, inp.message)
+    summary = _build_founder_brief(full_name or "", email or "", inp.interest_type, conversation_summary, score)
     threshold_met = score >= FOUNDER_FOLLOWUP_THRESHOLD
     esc = FounderEscalation(
         id=new_id(), org_slug=org, thread_id=inp.thread_id, lead_id=None, user_id=uid,
@@ -5836,7 +5880,7 @@ def founder_handoff(inp: FounderHandoffIn, x_org_slug: Optional[str] = Header(de
     )
     db.add(esc); db.commit()
     sent = False
-    notify_subject = _ascii_safe_text(f"Orkio founder handoff - {inp.interest_type}")
+    notify_subject = _ascii_safe_text(f"Orkio | Handoff founder - {inp.interest_type}")
     notify_summary = _ascii_safe_text(summary)
     try:
         if RESEND_INTERNAL_TO:
