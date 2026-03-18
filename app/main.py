@@ -39,51 +39,13 @@ import ssl as _ssl
 
 
 # Email via Resend (preferred). If RESEND_API_KEY is missing, email sending is skipped.
-def _env_clean(name: str, default: str = "") -> str:
-    raw = os.getenv(name, default)
-    if raw is None:
-        return default
-    s = str(raw).strip()
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        s = s[1:-1].strip()
-    return s
+RESEND_API_KEY = _clean_env(os.getenv("RESEND_API_KEY", ""))
+RESEND_FROM = _clean_env(os.getenv("RESEND_FROM", "Orkio <no-reply@orkio.ai>"), default="Orkio <no-reply@orkio.ai>")
+RESEND_INTERNAL_TO = _clean_env(os.getenv("RESEND_INTERNAL_TO", "daniel@patroai.com"), default="daniel@patroai.com")
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(_env_clean(name, str(default)) or str(default))
-    except Exception:
-        return default
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(_env_clean(name, str(default)) or str(default))
-    except Exception:
-        return default
-
-def _parse_recipients(raw: Optional[str]) -> List[str]:
-    if not raw:
-        return []
-    parts = re.split(r"[;,]", str(raw))
-    out: List[str] = []
-    seen = set()
-    for p in parts:
-        v = (p or "").strip()
-        if not v:
-            continue
-        key = v.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(v)
-    return out
-
-RESEND_API_KEY = _env_clean("RESEND_API_KEY", "")
-RESEND_FROM = _env_clean("RESEND_FROM", _env_clean("SMTP_FROM", _env_clean("SMTP_FROM_EMAIL", "Orkio <no-reply@orkio.ai>")))
-RESEND_INTERNAL_TO = _env_clean("RESEND_INTERNAL_TO", "daniel@patroai.com")
-
-PASSWORD_RESET_EXPIRES_MINUTES = _env_int("PASSWORD_RESET_EXPIRES_MINUTES", 20)
-FOUNDER_FOLLOWUP_THRESHOLD = _env_int("FOUNDER_FOLLOWUP_THRESHOLD", 9)
-CONFERENCE_STT_CONFIDENCE = _env_float("CONFERENCE_STT_CONFIDENCE", 0.78)
+PASSWORD_RESET_EXPIRES_MINUTES = int(os.getenv("PASSWORD_RESET_EXPIRES_MINUTES", "20"))
+FOUNDER_FOLLOWUP_THRESHOLD = int(os.getenv("FOUNDER_FOLLOWUP_THRESHOLD", "9"))
+CONFERENCE_STT_CONFIDENCE = float(os.getenv("CONFERENCE_STT_CONFIDENCE", "0.78"))
 
 FOUNDER_ALLOWED_ACTIONS = {
     "contact_requested",
@@ -102,17 +64,44 @@ _founder_guidance_lock = _threading.Lock()
 _founder_guidance_state: dict = {}  # {(org, thread_id): {"action": str, "turns_left": int, "goal": str}}
 
 
-def _send_resend_email(to_email: str, subject: str, text_body: str, *, html_body: Optional[str] = None) -> bool:
-    recipients = _parse_recipients(to_email)
-    if not RESEND_API_KEY:
-        logger.error("RESEND_SEND_SKIPPED missing_api_key from=%s subject=%s recipients=%s", RESEND_FROM, subject, recipients)
+def _parse_email_recipients(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(v) for v in value]
+    else:
+        raw_items = [str(value)]
+    joined = ",".join(raw_items)
+    parts = re.split(r"[;,]", joined)
+    out: List[str] = []
+    for part in parts:
+        email = _clean_env(part)
+        if email:
+            out.append(email)
+    # preserve order / remove duplicates
+    seen = set()
+    uniq: List[str] = []
+    for email in out:
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(email)
+    return uniq
+
+def _send_resend_email(to_email: Any, subject: str, text_body: str, *, html_body: Optional[str] = None) -> bool:
+    api_key = _clean_env(RESEND_API_KEY)
+    from_email = _clean_env(RESEND_FROM, default="Orkio <no-reply@orkio.ai>")
+    recipients = _parse_email_recipients(to_email)
+    if not api_key:
+        logger.error("RESEND_SEND_SKIPPED missing_api_key subject=%s recipients=%s", subject, recipients)
         return False
     if not recipients:
-        logger.error("RESEND_SEND_SKIPPED empty_recipients from=%s subject=%s raw=%r", RESEND_FROM, subject, to_email)
+        logger.error("RESEND_SEND_SKIPPED empty_recipients subject=%s", subject)
         return False
     try:
         data = {
-            "from": RESEND_FROM,
+            "from": from_email,
             "to": recipients,
             "subject": subject,
             "text": text_body,
@@ -123,39 +112,55 @@ def _send_resend_email(to_email: str, subject: str, text_body: str, *, html_body
             "https://api.resend.com/emails",
             data=json.dumps(data).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             method="POST",
         )
         ctx = _ssl.create_default_context()
-        with _urllib_request.urlopen(req, context=ctx, timeout=15) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            logger.info(
-                "RESEND_SEND_OK status=%s subject=%s recipients=%s body=%s",
-                getattr(resp, "status", "unknown"),
-                subject,
-                recipients,
-                body[:1000],
-            )
+        resp = _urllib_request.urlopen(req, context=ctx, timeout=10)
+        body = resp.read().decode("utf-8", errors="replace")
+        logger.info(
+            "RESEND_SEND_OK status=%s recipients=%s subject=%s body=%s",
+            getattr(resp, "status", "unknown"),
+            recipients,
+            subject,
+            body[:500],
+        )
         return True
     except Exception as e:
-        detail = ""
-        status = None
-        try:
-            status = getattr(e, "code", None)
-            payload = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
-            detail = payload[:2000]
-        except Exception:
-            detail = ""
-        logger.exception(
-            "RESEND_SEND_FAILED status=%s subject=%s recipients=%s detail=%s",
-            status,
-            subject,
-            recipients,
-            detail,
-        )
+        logger.exception("RESEND_SEND_FAILED recipients=%s subject=%s error=%s", recipients, subject, str(e))
         return False
+
+def _ascii_safe_text(v: str) -> str:
+    if not v:
+        return ""
+    replacements = {
+        "\u2192": "->",
+        "\u2190": "<-",
+        "\u2014": "-",
+        "\u2013": "-",
+        "\u2022": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u00a0": " ",
+        "\u2026": "...",
+    }
+    out = v
+    for src, dst in replacements.items():
+        out = out.replace(src, dst)
+    out = out.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    out = re.sub(r"[^\S\r\n]+", " ", out)
+    return out.strip()
+
+def _sanitize_tts_text(v: str) -> str:
+    out = _ascii_safe_text(v or "")
+    # keep line breaks readable but avoid weird punctuation that breaks TTS providers
+    out = re.sub(r"[\r\n]+", " ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out[:4096]
 
 _public_tts_lock = _threading.Lock()
 _public_tts_calls: dict = {}   # {ip: [timestamps...]}
@@ -1083,7 +1088,7 @@ def _generate_reset_token() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex
 
 def _send_password_reset_email(to_email: str, reset_token: str) -> bool:
-    base_url = (_env_clean("APP_BASE_URL", "") or _env_clean("PUBLIC_APP_URL", "")).strip().rstrip("/")
+    base_url = (os.getenv("APP_BASE_URL", "") or os.getenv("PUBLIC_APP_URL", "")).strip().rstrip("/")
     reset_link = f"{base_url}/auth?reset_token={reset_token}" if base_url else reset_token
     subject = "Orkio password reset"
     text_body = (
@@ -1091,13 +1096,7 @@ def _send_password_reset_email(to_email: str, reset_token: str) -> bool:
         f"Use this link or token within {PASSWORD_RESET_EXPIRES_MINUTES} minutes:\n{reset_link}\n\n"
         "If you did not request this change, you can ignore this message."
     )
-    html_body = (
-        "<p>We received a request to reset your Orkio password.</p>"
-        f"<p>Use this link within {PASSWORD_RESET_EXPIRES_MINUTES} minutes:</p>"
-        f"<p><a href=\"{reset_link}\">{reset_link}</a></p>"
-        "<p>If you did not request this change, you can ignore this message.</p>"
-    )
-    return _send_resend_email(to_email, subject, text_body, html_body=html_body)
+    return _send_resend_email(to_email, subject, text_body)
 
 def _score_founder_opportunity(email: str, interest_type: str, message: str) -> int:
     score = 0
@@ -4491,11 +4490,14 @@ async def tts_endpoint(
     voice = _VOICE_MAP.get((voice or "").strip().lower(), voice)
     voice = voice if voice in _VALID_VOICES else "nova"
     speed = max(0.25, min(4.0, inp.speed))
+    tts_input = _sanitize_tts_text(inp.text)
+    if not tts_input:
+        raise HTTPException(status_code=400, detail="TTS text is empty after sanitization")
 
     tts_model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
     logger.info(
         "v2v_play_start trace_id=%s org=%s voice=%s resolved_via=%s chars=%d model=%s",
-        trace_id, org, voice, resolved_via, len(inp.text), tts_model,
+        trace_id, org, voice, resolved_via, len(tts_input), tts_model,
     )
 
     try:
@@ -4503,7 +4505,7 @@ async def tts_endpoint(
         response = client.audio.speech.create(
             model=tts_model,
             voice=voice,
-            input=inp.text[:4096],
+            input=tts_input,
             speed=speed,
             response_format="mp3",
         )
@@ -4531,7 +4533,7 @@ async def tts_endpoint(
             response = client.audio.speech.create(
                 model="gpt-4o-mini-tts",
                 voice="nova",
-                input=inp.text[:4096],
+                input=tts_input,
                 speed=speed,
                 response_format="mp3",
             )
@@ -5776,10 +5778,10 @@ def forgot_password(inp: ForgotPasswordIn, x_org_slug: Optional[str] = Header(de
                 used_at=None, created_at=now_ts(),
             ))
             db.commit()
-            email_sent = _send_password_reset_email(email, raw)
-            logger.info("FORGOT_PASSWORD_EMAIL user_id=%s email=%s sent=%s", u.id, email, email_sent)
+            sent = _send_password_reset_email(email, raw)
+            logger.info("FORGOT_PASSWORD_EMAIL email=%s sent=%s", email, sent)
             try:
-                audit(db, org, u.id, "auth.forgot_password", request_id="forgot", path="/api/auth/forgot-password", status_code=200, latency_ms=0, meta={"email": email, "email_sent": bool(email_sent)})
+                audit(db, org, u.id, "auth.forgot_password", request_id="forgot", path="/api/auth/forgot-password", status_code=200, latency_ms=0, meta={"email": email})
             except Exception:
                 pass
         except Exception:
@@ -5829,34 +5831,22 @@ def founder_handoff(inp: FounderHandoffIn, x_org_slug: Optional[str] = Header(de
         founder_action=None, source=inp.source, created_at=now_ts(), updated_at=now_ts()
     )
     db.add(esc); db.commit()
-    email_sent = False
+    sent = False
+    notify_subject = _ascii_safe_text(f"Orkio founder handoff - {inp.interest_type}")
+    notify_summary = _ascii_safe_text(summary)
     try:
         if RESEND_INTERNAL_TO:
-            notify_body = (
-                f"{summary}\n\n"
-                f"Threshold met: {'yes' if threshold_met else 'no'}\n"
-                f"Thread id: {inp.thread_id or 'n/a'}\n"
-                f"Source: {inp.source or 'app_console'}\n"
+            sent = _send_resend_email(RESEND_INTERNAL_TO, notify_subject, notify_summary)
+            logger.info(
+                "FOUNDER_HANDOFF_NOTIFY score=%s threshold=%s threshold_met=%s sent=%s recipients=%s",
+                score, FOUNDER_FOLLOWUP_THRESHOLD, threshold_met, sent, RESEND_INTERNAL_TO
             )
-            email_sent = _send_resend_email(
-                RESEND_INTERNAL_TO,
-                f"Orkio founder handoff • {inp.interest_type}",
-                notify_body,
-            )
-        else:
-            logger.warning("FOUNDER_HANDOFF_NOTIFY_SKIPPED missing_internal_to escalation_id=%s", esc.id)
     except Exception:
-        logger.exception("FOUNDER_HANDOFF_NOTIFY_FAILED escalation_id=%s", esc.id)
-    logger.info(
-        "FOUNDER_HANDOFF_NOTIFY escalation_id=%s score=%s threshold=%s threshold_met=%s recipients=%s sent=%s",
-        esc.id,
-        score,
-        FOUNDER_FOLLOWUP_THRESHOLD,
-        threshold_met,
-        _parse_recipients(RESEND_INTERNAL_TO),
-        email_sent,
-    )
-    return {"ok": True, "escalation_id": esc.id, "score": score, "threshold_met": threshold_met, "summary": summary, "email_sent": bool(email_sent)}
+        logger.exception("FOUNDER_HANDOFF_NOTIFY_FAILED")
+        sent = False
+    if RESEND_INTERNAL_TO and not sent:
+        raise HTTPException(status_code=502, detail="Founder handoff email delivery failed.")
+    return {"ok": True, "escalation_id": esc.id, "score": score, "threshold_met": threshold_met, "summary": summary, "email_sent": sent}
 
 @app.get("/api/admin/investor/escalations")
 def admin_list_founder_escalations(user=Depends(require_admin_access), x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
