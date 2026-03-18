@@ -38,6 +38,20 @@ import urllib.request as _urllib_request
 import ssl as _ssl
 
 
+
+def _clean_env(v: Any, *, default: str = "") -> str:
+    """Normalize env var values.
+    Railway UI and some copy/paste workflows may store values with surrounding quotes.
+    """
+    if v is None:
+        return default
+    s = str(v).strip()
+    if not s:
+        return default
+    if (len(s) >= 2) and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    return s
+
 # Email via Resend (preferred). If RESEND_API_KEY is missing, email sending is skipped.
 RESEND_API_KEY = _clean_env(os.getenv("RESEND_API_KEY", ""))
 RESEND_FROM = _clean_env(os.getenv("RESEND_FROM", "Orkio <no-reply@orkio.ai>"), default="Orkio <no-reply@orkio.ai>")
@@ -114,6 +128,7 @@ def _send_resend_email(to_email: Any, subject: str, text_body: str, *, html_body
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "orkio-backend/1.0",
             },
             method="POST",
         )
@@ -230,18 +245,6 @@ except Exception as e:
 
 
 
-def _clean_env(v: Any, *, default: str = "") -> str:
-    """Normalize env var values.
-    Railway UI and some copy/paste workflows may store values with surrounding quotes.
-    """
-    if v is None:
-        return default
-    s = str(v).strip()
-    if not s:
-        return default
-    if (len(s) >= 2) and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        s = s[1:-1].strip()
-    return s
 
 def _is_placeholder_secret(s: str) -> bool:
     up = s.strip().upper()
@@ -4489,6 +4492,7 @@ async def tts_endpoint(
 
     voice = _VOICE_MAP.get((voice or "").strip().lower(), voice)
     voice = voice if voice in _VALID_VOICES else "nova"
+    safe_resolved_via = _ascii_safe_text(resolved_via) or "default"
     speed = max(0.25, min(4.0, inp.speed))
     tts_input = _sanitize_tts_text(inp.text)
     if not tts_input:
@@ -4524,7 +4528,7 @@ async def tts_endpoint(
                 "Cache-Control": "no-cache",
                 "X-Trace-Id": trace_id,
                 "X-V2V-Voice": voice,
-                "X-V2V-Resolved-Via": resolved_via,
+                "X-V2V-Resolved-Via": safe_resolved_via,
             },
         )
     except Exception as e:
@@ -4549,7 +4553,7 @@ async def tts_endpoint(
                     "Cache-Control": "no-cache",
                     "X-Trace-Id": trace_id,
                     "X-V2V-Voice": "nova",
-                    "X-V2V-Resolved-Via": resolved_via,
+                    "X-V2V-Resolved-Via": safe_resolved_via,
                     "X-V2V-Fallback-Used": "true",
                 },
             )
